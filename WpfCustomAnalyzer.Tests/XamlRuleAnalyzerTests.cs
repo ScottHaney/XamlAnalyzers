@@ -65,6 +65,26 @@ public class XamlRuleAnalyzerTests
         Assert.Contains("Maximum=1", message);   // dependency-property default
     }
 
+    // Minimum is set via {x:Static}. The analyzer should evaluate the referenced static member
+    // (StaticValues.SliderMinimum == 42) the way x:Static does and use that as the value.
+    [Fact]
+    public async Task Resolves_xStatic_Value_Via_Reflection()
+    {
+        var xaml =
+            $"<Window xmlns=\"{PresentationXmlns}\"\n" +
+            "        xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\"\n" +
+            "        xmlns:local=\"clr-namespace:WpfCustomAnalyzer.Tests;assembly=WpfCustomAnalyzer.Tests\">\n" +
+            "  <Slider Minimum=\"{x:Static local:StaticValues.SliderMinimum}\" Maximum=\"10\" />\n" +
+            "</Window>";
+
+        var diagnostics = await RunAnalyzerAsync(xaml);
+
+        var diagnostic = Assert.Single(diagnostics);
+        var message = diagnostic.GetMessage();
+        Assert.Contains("Minimum=42", message);   // evaluated from x:Static
+        Assert.Contains("Maximum=10", message);
+    }
+
     // Button is not a configured rule, so nothing should be reported.
     [Fact]
     public async Task Ignores_Elements_That_Match_No_Rule()
@@ -104,6 +124,10 @@ public class XamlRuleAnalyzerTests
         foreach (var name in new[] { "PresentationFramework", "PresentationCore", "WindowsBase" })
             references.Add(MetadataReference.CreateFromFile(Assembly.Load(name).Location));
 
+        // Reference this test assembly so the resolver can find StaticValues (used by the
+        // {x:Static} test) and reflection can load it at runtime.
+        references.Add(MetadataReference.CreateFromFile(typeof(XamlRuleAnalyzerTests).Assembly.Location));
+
         return CSharpCompilation.Create(
             "TargetAssembly",
             new[] { CSharpSyntaxTree.ParseText("class C { }") },
@@ -125,4 +149,14 @@ public class XamlRuleAnalyzerTests
 
         public override SourceText GetText(CancellationToken cancellationToken = default) => _text;
     }
+}
+
+/// <summary>
+/// A loadable type with a static member, referenced via {x:Static} by
+/// <see cref="WpfCustomAnalyzer.Tests.XamlRuleAnalyzerTests"/>. Must be top-level (not nested) so it
+/// is addressable as <c>clr-namespace:WpfCustomAnalyzer.Tests</c>.
+/// </summary>
+public static class StaticValues
+{
+    public static double SliderMinimum => 42;
 }

@@ -7,6 +7,10 @@ namespace XamlUtils
 {
     public class XamlParser
     {
+        // The XAML language namespace (the "x:" prefix), where StaticExtension (x:Static) lives.
+        private const string XamlLanguageNamespace = "http://schemas.microsoft.com/winfx/2006/xaml";
+
+
         /// <summary>
         /// Convenience overload that resolves XAML elements to CLR types by reflecting over the
         /// assemblies named by the rules. Suitable for standalone/desktop usage where those
@@ -56,13 +60,45 @@ namespace XamlUtils
             var objectStack = new Stack<ElementFrame>();
             var memberStack = new Stack<string>();
 
+            // Accumulated XAML-namespace-prefix -> namespace declarations, used to resolve the
+            // "prefix:" of an {x:Static prefix:Type.Member} expression. Declarations always precede
+            // their use, so a flat map (latest wins) is sufficient for this best-effort lookup.
+            var namespaces = new Dictionary<string, string>(StringComparer.Ordinal);
+
             while (reader.Read())
             {
                 switch (reader.NodeType)
                 {
+                    case XamlNodeType.NamespaceDeclaration:
+                    {
+                        var declaration = reader.Namespace;
+                        if (declaration?.Prefix is not null && declaration.Namespace is not null)
+                            namespaces[declaration.Prefix] = declaration.Namespace;
+                        break;
+                    }
+
                     case XamlNodeType.StartObject:
                     {
                         var xamlType = reader.Type;
+
+                        // Detect an {x:Static} markup extension sitting as the value of a member we
+                        // want to extract, so its referenced static value can be captured below.
+                        ElementFrame? staticTargetFrame = null;
+                        string? staticTargetMember = null;
+                        if (xamlType is not null
+                            && xamlType.Name == "StaticExtension"
+                            && xamlType.PreferredXamlNamespace == XamlLanguageNamespace
+                            && objectStack.Count > 0 && memberStack.Count > 0)
+                        {
+                            var parentFrame = objectStack.Peek();
+                            var parentMember = memberStack.Peek();
+                            if (parentFrame.WantedProps is not null && parentFrame.WantedProps.Contains(parentMember))
+                            {
+                                staticTargetFrame = parentFrame;
+                                staticTargetMember = parentMember;
+                            }
+                        }
+
                         var clrType = xamlType is null
                             ? null
                             : typeResolver.Resolve(xamlType.PreferredXamlNamespace ?? string.Empty, xamlType.Name);
@@ -91,7 +127,11 @@ namespace XamlUtils
                             wanted,
                             lineInfo.LineNumber,
                             lineInfo.LinePosition,
-                            xamlType?.Name ?? string.Empty));
+                            xamlType?.Name ?? string.Empty)
+                        {
+                            StaticTargetFrame = staticTargetFrame,
+                            StaticTargetMember = staticTargetMember,
+                        });
                         break;
                     }
 
@@ -112,7 +152,18 @@ namespace XamlUtils
                         {
                             var frame = objectStack.Peek();
                             var member = memberStack.Peek();
-                            if (frame.WantedProps is not null
+
+                            if (frame.StaticTargetFrame is not null
+                                && frame.StaticTargetMember is not null
+                                && (member == "_PositionalParameters" || member == "Member")
+                                && reader.Value is string staticExpression)
+                            {
+                                // This is the argument of an {x:Static} for a wanted member; evaluate
+                                // the referenced static member and store it on the target element.
+                                if (StaticMemberValues.TryResolve(typeResolver, namespaces, staticExpression, out var staticValue))
+                                    frame.StaticTargetFrame.Captured[frame.StaticTargetMember] = staticValue;
+                            }
+                            else if (frame.WantedProps is not null
                                 && frame.WantedProps.Contains(member)
                                 && reader.Value is not null)
                             {
@@ -193,6 +244,11 @@ namespace XamlUtils
             public int LineNumber { get; }
             public int LinePosition { get; }
             public string ElementName { get; }
+
+            // When this frame is an {x:Static} markup extension that supplies the value of a wanted
+            // member, these point at the element/member whose value it should populate.
+            public ElementFrame? StaticTargetFrame { get; set; }
+            public string? StaticTargetMember { get; set; }
         }
     }
 
