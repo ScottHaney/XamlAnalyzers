@@ -86,7 +86,7 @@ namespace WpfCustomAnalyzer
 
                     var props = violation.ExtractedProperties.Count == 0
                         ? string.Empty
-                        : " (" + string.Join(", ", violation.ExtractedProperties.Select(kv => $"{kv.Key}={kv.Value}")) + ")";
+                        : " (" + string.Join(", ", violation.ExtractedProperties.Select(kv => $"{kv.Key}={kv.Value.Value} [{kv.Value.Source}]")) + ")";
 
                     context.ReportDiagnostic(Diagnostic.Create(
                         Rule, location, violation.Location.ElementName, props));

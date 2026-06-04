@@ -347,16 +347,22 @@ namespace XamlUtils
                         foreach (var rule in frame.MatchedRules)
                         {
                             // Resolution order per property: direct value, then style setter, then
-                            // the dependency-property default; otherwise omitted.
-                            var props = new Dictionary<string, string>(StringComparer.Ordinal);
+                            // the dependency-property default. Every requested property gets an
+                            // entry recording where its value came from (or that none was found).
+                            var props = new Dictionary<string, PropertyValue>(StringComparer.Ordinal);
                             foreach (var name in rule.PropsToExtract)
                             {
+                                PropertyValue resolved;
                                 if (frame.Captured.TryGetValue(name, out var value))
-                                    props[name] = value;
+                                    resolved = new PropertyValue(value, PropertyValueSource.LocalValue);
                                 else if (styleSetters.TryGetValue(name, out var setterValue))
-                                    props[name] = setterValue;
+                                    resolved = new PropertyValue(setterValue, PropertyValueSource.StyleSetterValue);
                                 else if (DependencyPropertyDefaults.TryGetDefault(rule.TypeInfo, name, out var defaultValue))
-                                    props[name] = defaultValue;
+                                    resolved = new PropertyValue(defaultValue, PropertyValueSource.DefaultValue);
+                                else
+                                    resolved = new PropertyValue(null, PropertyValueSource.NotValueFound);
+
+                                props[name] = resolved;
                             }
 
                             results.Add(new RuleViolationResult(rule, location, props));
@@ -648,11 +654,34 @@ namespace XamlUtils
     /// </summary>
     /// <param name="FailedRule"></param>
     /// <param name="Location">This is the file location information needed for the roslyn analyzer to add a red squiggle. The red squiggle should go underneath the name of the XamlElement matched by the FailedRule</param>
-    /// <param name="ExtractedProperties">The values of the matched element's members named in <see cref="XamlRule.PropsToExtract"/>, keyed by member name. Members that were not present on the element are omitted.</param>
+    /// <param name="ExtractedProperties">The resolved value of each member named in <see cref="XamlRule.PropsToExtract"/>, keyed by member name. Every requested member has an entry; see <see cref="PropertyValue.Source"/> for where the value came from (or <see cref="PropertyValueSource.NotValueFound"/> when none could be determined).</param>
     public record RuleViolationResult(
         XamlRule FailedRule,
         IXamlRuleFailureLocation Location,
-        IReadOnlyDictionary<string, string> ExtractedProperties);
+        IReadOnlyDictionary<string, PropertyValue> ExtractedProperties);
+
+    /// <summary>
+    /// A resolved property value together with where it came from.
+    /// </summary>
+    /// <param name="Value">The value as a string, or <c>null</c> when <paramref name="Source"/> is <see cref="PropertyValueSource.NotValueFound"/>.</param>
+    /// <param name="Source">Where the value was resolved from.</param>
+    public record PropertyValue(string? Value, PropertyValueSource Source);
+
+    /// <summary>Where a <see cref="PropertyValue"/> was resolved from.</summary>
+    public enum PropertyValueSource
+    {
+        /// <summary>No value could be determined for the property.</summary>
+        NotValueFound,
+
+        /// <summary>Set directly on the XAML element (e.g. <c>Minimum="0"</c>).</summary>
+        LocalValue,
+
+        /// <summary>Supplied by a Style setter (keyed, keyless, inline, or referenced — it doesn't matter which).</summary>
+        StyleSetterValue,
+
+        /// <summary>The dependency property's registered default value.</summary>
+        DefaultValue,
+    }
 
     /// <summary>
     /// Location information for where to start and end the red squiggle in the XAML file for a rule violation. This is needed for the roslyn analyzer to add a red squiggle underneath the name of the XamlElement matched by the FailedRule

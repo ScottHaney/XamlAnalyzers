@@ -301,6 +301,42 @@ public class XamlRuleAnalyzerTests
         Assert.Contains("Minimum=8", message);   // direct value wins over the setter's 5
     }
 
+    // Each resolved property reports where its value came from (and NotValueFound -> null value).
+    [Fact]
+    public void PropertyValue_Reports_Its_Source()
+    {
+        var xaml =
+            $"<StackPanel xmlns=\"{PresentationXmlns}\"\n" +
+            "            xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\">\n" +
+            "  <StackPanel.Resources>\n" +
+            "    <Style x:Key=\"s\" TargetType=\"Slider\"><Setter Property=\"Maximum\" Value=\"50\"/></Style>\n" +
+            "  </StackPanel.Resources>\n" +
+            "  <Slider Minimum=\"3\" Style=\"{StaticResource s}\" />\n" +
+            "  <Slider />\n" +
+            "</StackPanel>";
+
+        var resolver = new CompilationXamlTypeResolver(CreateWpfCompilation());
+        var rule = new XamlRule(
+            new XamlElementType("System.Windows.Controls", "Slider", "PresentationFramework"),
+            new[] { "Minimum", "Maximum", "NotAProp" });
+
+        var results = new XamlParser().ParseXaml(xaml, resolver, rule).ToList();
+
+        Assert.Equal(2, results.Count);
+
+        // First Slider: local value, style-setter value, and a property with no value anywhere.
+        var first = results[0].ExtractedProperties;
+        Assert.Equal(new PropertyValue("3", PropertyValueSource.LocalValue), first["Minimum"]);
+        Assert.Equal(new PropertyValue("50", PropertyValueSource.StyleSetterValue), first["Maximum"]);
+        Assert.Equal(new PropertyValue(null, PropertyValueSource.NotValueFound), first["NotAProp"]);
+
+        // Second (bare) Slider: both fall back to the dependency-property defaults.
+        var second = results[1].ExtractedProperties;
+        Assert.Equal(new PropertyValue("0", PropertyValueSource.DefaultValue), second["Minimum"]);
+        Assert.Equal(new PropertyValue("1", PropertyValueSource.DefaultValue), second["Maximum"]);
+        Assert.Equal(new PropertyValue(null, PropertyValueSource.NotValueFound), second["NotAProp"]);
+    }
+
     // Button is not a configured rule, so nothing should be reported.
     [Fact]
     public async Task Ignores_Elements_That_Match_No_Rule()
