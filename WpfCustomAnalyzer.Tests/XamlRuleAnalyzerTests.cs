@@ -155,6 +155,152 @@ public class XamlRuleAnalyzerTests
         Assert.Contains("Maximum=2", message);
     }
 
+    // An inline <Slider.Style> setter supplies Minimum; Maximum falls back to its DP default.
+    [Fact]
+    public async Task Resolves_Property_From_Inline_Style_Setter()
+    {
+        var xaml =
+            $"<Slider xmlns=\"{PresentationXmlns}\"\n" +
+            "        xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\">\n" +
+            "  <Slider.Style>\n" +
+            "    <Style TargetType=\"Slider\"><Setter Property=\"Minimum\" Value=\"3\"/></Style>\n" +
+            "  </Slider.Style>\n" +
+            "</Slider>";
+
+        var diagnostics = await RunAnalyzerAsync(xaml);
+
+        var message = Assert.Single(diagnostics).GetMessage();
+        Assert.Contains("Minimum=3", message);
+        Assert.Contains("Maximum=1", message); // DP default
+    }
+
+    // Style="{StaticResource}" plus a BasedOn chain: Minimum from the derived style, Maximum
+    // inherited from the base style it is BasedOn.
+    [Fact]
+    public async Task Resolves_Style_Via_StaticResource_With_BasedOn_Inheritance()
+    {
+        var xaml =
+            $"<StackPanel xmlns=\"{PresentationXmlns}\"\n" +
+            "            xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\">\n" +
+            "  <StackPanel.Resources>\n" +
+            "    <Style x:Key=\"baseStyle\" TargetType=\"Slider\"><Setter Property=\"Maximum\" Value=\"50\"/></Style>\n" +
+            "    <Style x:Key=\"derived\" TargetType=\"Slider\" BasedOn=\"{StaticResource baseStyle}\">\n" +
+            "      <Setter Property=\"Minimum\" Value=\"5\"/>\n" +
+            "    </Style>\n" +
+            "  </StackPanel.Resources>\n" +
+            "  <Slider Style=\"{StaticResource derived}\" />\n" +
+            "</StackPanel>";
+
+        var diagnostics = await RunAnalyzerAsync(xaml);
+
+        var message = Assert.Single(diagnostics).GetMessage();
+        Assert.Contains("Minimum=5", message);
+        Assert.Contains("Maximum=50", message);
+    }
+
+    // A derived style's setter overrides the same property set by the style it is BasedOn.
+    [Fact]
+    public async Task Derived_Style_Setter_Overrides_Base()
+    {
+        var xaml =
+            $"<StackPanel xmlns=\"{PresentationXmlns}\"\n" +
+            "            xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\">\n" +
+            "  <StackPanel.Resources>\n" +
+            "    <Style x:Key=\"baseStyle\" TargetType=\"Slider\">\n" +
+            "      <Setter Property=\"Minimum\" Value=\"1\"/><Setter Property=\"Maximum\" Value=\"2\"/>\n" +
+            "    </Style>\n" +
+            "    <Style x:Key=\"derived\" TargetType=\"Slider\" BasedOn=\"{StaticResource baseStyle}\">\n" +
+            "      <Setter Property=\"Minimum\" Value=\"9\"/>\n" +
+            "    </Style>\n" +
+            "  </StackPanel.Resources>\n" +
+            "  <Slider Style=\"{StaticResource derived}\" />\n" +
+            "</StackPanel>";
+
+        var diagnostics = await RunAnalyzerAsync(xaml);
+
+        var message = Assert.Single(diagnostics).GetMessage();
+        Assert.Contains("Minimum=9", message); // derived overrides base's 1
+        Assert.Contains("Maximum=2", message); // from base
+    }
+
+    // A keyless implicit style whose TargetType matches applies when no Style is set on the element.
+    [Fact]
+    public async Task Implicit_Keyless_Style_Applies_By_TargetType()
+    {
+        var xaml =
+            $"<StackPanel xmlns=\"{PresentationXmlns}\">\n" +
+            "  <StackPanel.Resources>\n" +
+            "    <Style TargetType=\"Slider\"><Setter Property=\"Minimum\" Value=\"4\"/></Style>\n" +
+            "  </StackPanel.Resources>\n" +
+            "  <Slider />\n" +
+            "</StackPanel>";
+
+        var diagnostics = await RunAnalyzerAsync(xaml);
+
+        var message = Assert.Single(diagnostics).GetMessage();
+        Assert.Contains("Minimum=4", message);
+        Assert.Contains("Maximum=1", message); // DP default
+    }
+
+    // {x:Type Slider} as a TargetType resolves the same as the bare "Slider" form.
+    [Fact]
+    public async Task Implicit_Style_Matches_TargetType_Via_xType()
+    {
+        var xaml =
+            $"<StackPanel xmlns=\"{PresentationXmlns}\"\n" +
+            "            xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\">\n" +
+            "  <StackPanel.Resources>\n" +
+            "    <Style TargetType=\"{x:Type Slider}\"><Setter Property=\"Minimum\" Value=\"6\"/></Style>\n" +
+            "  </StackPanel.Resources>\n" +
+            "  <Slider />\n" +
+            "</StackPanel>";
+
+        var diagnostics = await RunAnalyzerAsync(xaml);
+
+        var message = Assert.Single(diagnostics).GetMessage();
+        Assert.Contains("Minimum=6", message);
+    }
+
+    // A directly-set Style suppresses any matching implicit (keyless) style.
+    [Fact]
+    public async Task Direct_Style_Suppresses_Implicit_Style()
+    {
+        var xaml =
+            $"<StackPanel xmlns=\"{PresentationXmlns}\"\n" +
+            "            xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\">\n" +
+            "  <StackPanel.Resources>\n" +
+            "    <Style TargetType=\"Slider\"><Setter Property=\"Minimum\" Value=\"4\"/></Style>\n" +
+            "    <Style x:Key=\"explicitStyle\" TargetType=\"Slider\"><Setter Property=\"Maximum\" Value=\"7\"/></Style>\n" +
+            "  </StackPanel.Resources>\n" +
+            "  <Slider Style=\"{StaticResource explicitStyle}\" />\n" +
+            "</StackPanel>";
+
+        var diagnostics = await RunAnalyzerAsync(xaml);
+
+        var message = Assert.Single(diagnostics).GetMessage();
+        Assert.Contains("Maximum=7", message);   // from the explicit style
+        Assert.Contains("Minimum=0", message);   // DP default — the implicit style is ignored
+    }
+
+    // A value set directly on the element wins over the same property from its style.
+    [Fact]
+    public async Task Direct_Value_Overrides_Style_Setter()
+    {
+        var xaml =
+            $"<StackPanel xmlns=\"{PresentationXmlns}\"\n" +
+            "            xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\">\n" +
+            "  <StackPanel.Resources>\n" +
+            "    <Style x:Key=\"s\" TargetType=\"Slider\"><Setter Property=\"Minimum\" Value=\"5\"/></Style>\n" +
+            "  </StackPanel.Resources>\n" +
+            "  <Slider Minimum=\"8\" Style=\"{StaticResource s}\" />\n" +
+            "</StackPanel>";
+
+        var diagnostics = await RunAnalyzerAsync(xaml);
+
+        var message = Assert.Single(diagnostics).GetMessage();
+        Assert.Contains("Minimum=8", message);   // direct value wins over the setter's 5
+    }
+
     // Button is not a configured rule, so nothing should be reported.
     [Fact]
     public async Task Ignores_Elements_That_Match_No_Rule()

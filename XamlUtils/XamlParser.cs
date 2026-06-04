@@ -17,6 +17,19 @@ namespace XamlUtils
         /// </summary>
         public const string InvalidResourceValue = "_INVALID_VALUE_";
 
+        // XAML member / type names we special-case while streaming.
+        private const string ResourcesMember = "Resources";
+        private const string StyleMember = "Style";
+        private const string StyleObjectName = "Style";
+        private const string SetterObjectName = "Setter";
+        private const string TypeExtensionName = "TypeExtension";
+        private const string TargetTypeMember = "TargetType";
+        private const string BasedOnMember = "BasedOn";
+        private const string KeyMember = "Key";
+        private const string PropertyMember = "Property";
+        private const string ValueMember = "Value";
+        private const string PositionalParametersMember = "_PositionalParameters";
+        private const string InitializationMember = "_Initialization";
 
         /// <summary>
         /// Convenience overload that resolves XAML elements to CLR types by reflecting over the
@@ -34,14 +47,14 @@ namespace XamlUtils
         /// <remarks>
         /// The XAML is read structurally with <see cref="XamlXmlReader"/> — a sequential node
         /// stream (StartObject/EndObject for elements, StartMember/EndMember/Value for
-        /// properties). Because the reader works at the XAML object-model level it surfaces both
-        /// ways of writing a property identically:
-        ///   - inline:           &lt;Slider Minimum="0" /&gt;
-        ///   - property element:  &lt;Slider&gt;&lt;Slider.Minimum&gt;0&lt;/Slider.Minimum&gt;&lt;/Slider&gt;
-        /// No schema context is used, so elements need not be resolvable for reading — the
-        /// reader still yields each element's XAML namespace, local name, members and line info.
-        /// Mapping that (namespace, name) to a CLR identity is delegated to
-        /// <paramref name="typeResolver"/>, which is what makes the matching environment-agnostic.
+        /// properties). No schema context is used, so elements need not be resolvable for reading;
+        /// mapping (namespace, name) to a CLR identity is delegated to <paramref name="typeResolver"/>.
+        /// For each matched element a property is resolved in this order:
+        ///   1. a value set directly on the element (literal, {x:Static}, or {StaticResource});
+        ///   2. a Style setter (the element's inline style, Style="{StaticResource}", or — when no
+        ///      Style is set directly — an implicit keyless style matched by TargetType), following
+        ///      the BasedOn chain with nearer styles overriding their bases;
+        ///   3. the dependency-property default (via reflection), if available.
         /// </remarks>
         public IEnumerable<RuleViolationResult> ParseXaml(
             string xaml,
@@ -61,15 +74,14 @@ namespace XamlUtils
                 new XamlXmlReaderSettings { ProvideLineInfo = true });
             var lineInfo = (IXamlLineInfo)reader;
 
-            // One frame per open element. The frame on top of the stack always owns the
-            // member/value currently being read, so we can capture an element's *direct*
-            // members (the PropsToExtract values) without confusing them with nested children.
+            // One frame per open object. The frame on top of the stack owns the member/value being
+            // read; ancestor frames (still on the stack) hold their in-scope resources and styles.
             var objectStack = new Stack<ElementFrame>();
             var memberStack = new Stack<string>();
 
             // Accumulated XAML-namespace-prefix -> namespace declarations, used to resolve the
-            // "prefix:" of an {x:Static prefix:Type.Member} expression. Declarations always precede
-            // their use, so a flat map (latest wins) is sufficient for this best-effort lookup.
+            // "prefix:" of {x:Static prefix:Type.Member} and a style's TargetType. Declarations
+            // always precede their use, so a flat map (latest wins) is sufficient.
             var namespaces = new Dictionary<string, string>(StringComparer.Ordinal);
 
             while (reader.Read())
@@ -87,33 +99,9 @@ namespace XamlUtils
                     case XamlNodeType.StartObject:
                     {
                         var xamlType = reader.Type;
-
-                        // Markup extensions that supply a member value: {x:Static ...} and
-                        // {StaticResource ...}. When one is the value of a member we want to extract,
-                        // remember which element/member it should populate (resolved at its Value).
-                        var markupKind = MarkupKindOf(xamlType);
-                        ElementFrame? markupTargetFrame = null;
-                        string? markupTargetMember = null;
-                        if (markupKind != MarkupKind.None && objectStack.Count > 0 && memberStack.Count > 0)
-                        {
-                            var parentFrame = objectStack.Peek();
-                            var parentMember = memberStack.Peek();
-                            if (parentFrame.WantedProps is not null && parentFrame.WantedProps.Contains(parentMember))
-                            {
-                                markupTargetFrame = parentFrame;
-                                markupTargetMember = parentMember;
-                            }
-                        }
-
-                        // An explicit <ResourceDictionary> written directly inside an
-                        // <Element.Resources> is the resource dictionary for that element.
-                        ElementFrame? resourceDictOwner = null;
-                        if (objectStack.Count > 0 && memberStack.Count > 0 && memberStack.Peek() == ResourcesMember)
-                            resourceDictOwner = objectStack.Peek();
-
-                        // An object sitting directly inside a resource dictionary is a resource entry
-                        // belonging to that dictionary's owner element.
-                        var resourceEntryOwner = objectStack.Count > 0 ? objectStack.Peek().ResourceDictOwner : null;
+                        var typeName = xamlType?.Name ?? string.Empty;
+                        var parentFrame = objectStack.Count > 0 ? objectStack.Peek() : null;
+                        var parentMember = memberStack.Count > 0 ? memberStack.Peek() : null;
 
                         var clrType = xamlType is null
                             ? null
@@ -125,8 +113,7 @@ namespace XamlUtils
                         {
                             foreach (var rule in rulesToCheck)
                             {
-                                // XamlElementType is a record: this compares Namespace, Name and
-                                // Assembly by value, which is exactly the match criteria.
+                                // XamlElementType is a record: compares Namespace/Name/Assembly by value.
                                 if (rule.TypeInfo != clrType)
                                     continue;
 
@@ -138,31 +125,86 @@ namespace XamlUtils
 
                         // IXamlLineInfo, on a StartObject, points at the first character of the
                         // element's name (the char right after '<') — where the squiggle starts.
-                        objectStack.Push(new ElementFrame(
+                        var frame = new ElementFrame(
                             matched,
                             wanted,
                             lineInfo.LineNumber,
                             lineInfo.LinePosition,
-                            xamlType?.Name ?? string.Empty)
+                            typeName)
                         {
-                            MarkupKind = markupKind,
-                            MarkupTargetFrame = markupTargetFrame,
-                            MarkupTargetMember = markupTargetMember,
-                            ResourceDictOwner = resourceDictOwner,
-                            ResourceEntryOwner = resourceEntryOwner,
-                            ResourceEntryIsPrimitive = resourceEntryOwner is not null && IsPrimitiveResourceType(xamlType),
-                        });
+                            ResolvedType = clrType,
+                        };
+
+                        // {x:Static}/{StaticResource} supplying a wanted member's value.
+                        var markupKind = MarkupKindOf(xamlType);
+                        frame.MarkupKind = markupKind;
+                        if (markupKind != MarkupKind.None && parentFrame is not null && parentMember is not null
+                            && parentFrame.WantedProps is not null && parentFrame.WantedProps.Contains(parentMember))
+                        {
+                            frame.MarkupTargetFrame = parentFrame;
+                            frame.MarkupTargetMember = parentMember;
+                        }
+
+                        var isStyle = typeName == StyleObjectName;
+
+                        // An explicit <ResourceDictionary> written directly inside <Element.Resources>.
+                        if (parentMember == ResourcesMember && parentFrame is not null)
+                            frame.ResourceDictOwner = parentFrame;
+
+                        // An object directly inside a resource dictionary is a resource entry — unless
+                        // it is a Style, which is handled as a style (below) rather than a primitive.
+                        if (!isStyle && parentFrame?.ResourceDictOwner is not null)
+                        {
+                            frame.ResourceEntryOwner = parentFrame.ResourceDictOwner;
+                            frame.ResourceEntryIsPrimitive = IsPrimitiveResourceType(xamlType);
+                        }
+
+                        if (isStyle)
+                        {
+                            // A Style is either declared in <Element.Resources> (keyed or implicit) or
+                            // inline as the value of an element's Style member.
+                            if (parentFrame?.ResourceDictOwner is not null)
+                                frame.StyleBuilding = new StyleInfo(parentFrame.ResourceDictOwner, isInline: false);
+                            else if (parentFrame?.StyleMemberOwner is not null)
+                                frame.StyleBuilding = new StyleInfo(parentFrame.StyleMemberOwner, isInline: true);
+                            else if (parentMember == StyleMember && parentFrame is not null)
+                                frame.StyleBuilding = new StyleInfo(parentFrame, isInline: true);
+                        }
+                        else if (typeName == SetterObjectName && parentFrame?.StyleBuilding is not null)
+                        {
+                            frame.SetterTargetStyle = parentFrame.StyleBuilding;
+                        }
+                        else if (typeName == TypeExtensionName && parentMember == TargetTypeMember
+                                 && parentFrame?.StyleBuilding is not null)
+                        {
+                            // TargetType="{x:Type ...}" — its positional parameter is the type name.
+                            frame.StyleTargetTypeSink = parentFrame.StyleBuilding;
+                        }
+
+                        if (markupKind == MarkupKind.StaticResource && parentFrame is not null)
+                        {
+                            if (parentFrame.StyleBuilding is not null && parentMember == BasedOnMember)
+                                frame.StyleBasedOnSink = parentFrame.StyleBuilding;       // BasedOn="{StaticResource ...}"
+                            else if (parentMember == StyleMember && parentFrame.MatchedRules is not null)
+                                frame.StyleKeySinkFrame = parentFrame;                    // Style="{StaticResource ...}"
+                        }
+
+                        objectStack.Push(frame);
                         break;
                     }
 
                     case XamlNodeType.GetObject:
                     {
-                        // A "get" object — e.g. the implicit ResourceDictionary behind
-                        // <Element.Resources>. If it backs a Resources member, record the element
-                        // that owns it so the entries inside can be attributed to that element.
+                        // A "get" object — e.g. the implicit collection behind <Element.Resources> or
+                        // the wrapper around an inline <Element.Style>. Tag it with the owning element
+                        // so its contents can be attributed correctly.
                         var getFrame = new ElementFrame(null, null, 0, 0, string.Empty);
-                        if (objectStack.Count > 0 && memberStack.Count > 0 && memberStack.Peek() == ResourcesMember)
-                            getFrame.ResourceDictOwner = objectStack.Peek();
+                        var parentFrame = objectStack.Count > 0 ? objectStack.Peek() : null;
+                        var parentMember = memberStack.Count > 0 ? memberStack.Peek() : null;
+                        if (parentFrame is not null && parentMember == ResourcesMember)
+                            getFrame.ResourceDictOwner = parentFrame;
+                        else if (parentFrame is not null && parentMember == StyleMember && parentFrame.MatchedRules is not null)
+                            getFrame.StyleMemberOwner = parentFrame;
                         objectStack.Push(getFrame);
                         break;
                     }
@@ -173,39 +215,62 @@ namespace XamlUtils
 
                     case XamlNodeType.Value:
                     {
-                        // A value belongs to the current member of the current (top) element.
                         if (objectStack.Count > 0 && memberStack.Count > 0)
                         {
                             var frame = objectStack.Peek();
                             var member = memberStack.Peek();
+                            var isPositional = member == PositionalParametersMember || member == "Member";
+                            var stringValue = reader.Value as string;
 
-                            if (frame.MarkupKind != MarkupKind.None
-                                && frame.MarkupTargetFrame is not null
-                                && frame.MarkupTargetMember is not null
-                                && (member == "_PositionalParameters" || member == "Member")
-                                && reader.Value is string markupArgument)
+                            // Argument of a markup extension (the frame is that markup extension).
+                            if (isPositional && stringValue is not null)
                             {
-                                if (frame.MarkupKind == MarkupKind.XStatic)
+                                if (frame.MarkupKind == MarkupKind.XStatic
+                                    && frame.MarkupTargetFrame is not null && frame.MarkupTargetMember is not null)
                                 {
-                                    // {x:Static}: evaluate the static member. On failure leave the
-                                    // member to its other fallbacks (DP default, etc.).
-                                    if (StaticMemberValues.TryResolve(typeResolver, namespaces, markupArgument, out var staticValue))
+                                    // {x:Static}: evaluate the static member; on failure fall through.
+                                    if (StaticMemberValues.TryResolve(typeResolver, namespaces, stringValue, out var staticValue))
                                         frame.MarkupTargetFrame.Captured[frame.MarkupTargetMember] = staticValue;
                                 }
-                                else // StaticResource
+                                else if (frame.MarkupKind == MarkupKind.StaticResource
+                                    && frame.MarkupTargetFrame is not null && frame.MarkupTargetMember is not null)
                                 {
-                                    // {StaticResource}: search the ancestor chain for the keyed
-                                    // resource. A miss or a non-primitive value yields the marker.
+                                    // {StaticResource} for a member value.
                                     frame.MarkupTargetFrame.Captured[frame.MarkupTargetMember] =
-                                        ResolveStaticResource(objectStack, markupArgument);
+                                        ResolveStaticResource(objectStack, stringValue);
                                 }
+                                else if (frame.StyleKeySinkFrame is not null)
+                                {
+                                    frame.StyleKeySinkFrame.StyleStaticResourceKey = stringValue;
+                                }
+                                else if (frame.StyleBasedOnSink is not null)
+                                {
+                                    frame.StyleBasedOnSink.BasedOnKey = stringValue;
+                                }
+                                else if (frame.StyleTargetTypeSink is not null)
+                                {
+                                    frame.StyleTargetTypeSink.TargetTypeName = stringValue;
+                                }
+                            }
+                            else if (frame.StyleBuilding is not null && reader.Value is not null)
+                            {
+                                if (member == KeyMember)
+                                    frame.StyleBuilding.Key = reader.Value.ToString();
+                                else if (member == TargetTypeMember)
+                                    frame.StyleBuilding.TargetTypeName = reader.Value.ToString();
+                            }
+                            else if (frame.SetterTargetStyle is not null && reader.Value is not null)
+                            {
+                                if (member == PropertyMember)
+                                    frame.SetterProperty = reader.Value.ToString();
+                                else if (member == ValueMember)
+                                    frame.SetterValue = reader.Value.ToString();
                             }
                             else if (frame.ResourceEntryOwner is not null && reader.Value is not null)
                             {
-                                // Collecting a resource entry's x:Key and its primitive text value.
-                                if (member == "Key")
+                                if (member == KeyMember)
                                     frame.ResourceEntryKey = reader.Value.ToString();
-                                else if (member == "_Initialization")
+                                else if (member == InitializationMember)
                                     frame.ResourceEntryValue = reader.Value.ToString();
                             }
                             else if (frame.WantedProps is not null
@@ -230,9 +295,7 @@ namespace XamlUtils
 
                         var frame = objectStack.Pop();
 
-                        // Commit a finished resource entry to its owning element's resources, so it
-                        // is visible to {StaticResource} lookups from that element and its descendants
-                        // (and goes out of scope now that this owner-or-deeper scope is closing).
+                        // Commit a primitive resource entry to its owning element's resources.
                         if (frame.ResourceEntryOwner is not null && frame.ResourceEntryKey is not null)
                         {
                             var owner = frame.ResourceEntryOwner;
@@ -241,23 +304,57 @@ namespace XamlUtils
                                 new ResourceEntry(frame.ResourceEntryIsPrimitive, frame.ResourceEntryValue);
                         }
 
+                        // Commit a finished setter to the style being built.
+                        if (frame.SetterTargetStyle is not null && frame.SetterProperty is not null)
+                        {
+                            frame.SetterTargetStyle.Setters.Add(
+                                new KeyValuePair<string, string>(frame.SetterProperty, frame.SetterValue ?? string.Empty));
+                        }
+
+                        // Commit a finished style to its owning element.
+                        if (frame.StyleBuilding is not null)
+                        {
+                            var style = frame.StyleBuilding;
+                            var owner = style.Owner;
+                            if (style.IsInline)
+                            {
+                                owner.InlineStyle = style;
+                            }
+                            else if (style.Key is not null)
+                            {
+                                owner.KeyedStyles ??= new Dictionary<string, StyleInfo>(StringComparer.Ordinal);
+                                owner.KeyedStyles[style.Key] = style;
+                            }
+                            else if (style.TargetTypeName is not null)
+                            {
+                                owner.ImplicitStyles ??= new List<StyleInfo>();
+                                owner.ImplicitStyles.Add(style);
+                            }
+                        }
+
                         if (frame.MatchedRules is null)
                             break;
+
+                        // The element plus its still-open ancestors form the resource/style scope
+                        // (nearest first). Anything not an ancestor has already been popped.
+                        var scope = new List<ElementFrame>(objectStack.Count + 1) { frame };
+                        scope.AddRange(objectStack);
+                        var styleSetters = ResolveStyleSetters(frame, scope, typeResolver, namespaces);
 
                         var location = new XamlRuleFailureLocation(
                             frame.LineNumber, frame.LinePosition, frame.ElementName);
 
                         foreach (var rule in frame.MatchedRules)
                         {
-                            // Each result carries only the props that rule asked for. A prop that
-                            // isn't present in the markup falls back to its dependency-property
-                            // default (when the type is loadable and it is a DP); otherwise it's
-                            // omitted.
+                            // Resolution order per property: direct value, then style setter, then
+                            // the dependency-property default; otherwise omitted.
                             var props = new Dictionary<string, string>(StringComparer.Ordinal);
                             foreach (var name in rule.PropsToExtract)
                             {
                                 if (frame.Captured.TryGetValue(name, out var value))
                                     props[name] = value;
+                                else if (styleSetters.TryGetValue(name, out var setterValue))
+                                    props[name] = setterValue;
                                 else if (DependencyPropertyDefaults.TryGetDefault(rule.TypeInfo, name, out var defaultValue))
                                     props[name] = defaultValue;
                             }
@@ -271,9 +368,6 @@ namespace XamlUtils
 
             return results;
         }
-
-        /// <summary>The XAML member exposing a WPF resource dictionary (<c>FrameworkElement.Resources</c>).</summary>
-        private const string ResourcesMember = "Resources";
 
         private static MarkupKind MarkupKindOf(XamlType? type)
         {
@@ -301,10 +395,9 @@ namespace XamlUtils
         }
 
         /// <summary>
-        /// Resolves a {StaticResource} by walking the open element scopes from nearest ancestor to
-        /// the root (anything not an ancestor has already been popped, so isn't visible). Returns the
-        /// primitive resource's string value, or <see cref="InvalidResourceValue"/> when the key is
-        /// not found or the resource isn't a primitive int/double/string.
+        /// Resolves a {StaticResource} primitive by walking the open scopes from nearest ancestor to
+        /// the root. Returns the primitive's string value, or <see cref="InvalidResourceValue"/> when
+        /// the key is missing or the resource isn't a primitive int/double/string.
         /// </summary>
         private static string ResolveStaticResource(Stack<ElementFrame> objectStack, string key)
         {
@@ -314,6 +407,110 @@ namespace XamlUtils
                     return entry.IsPrimitive && entry.Value is not null ? entry.Value : InvalidResourceValue;
             }
             return InvalidResourceValue;
+        }
+
+        /// <summary>
+        /// Determines the element's effective style and returns the merged Property→Value map from its
+        /// BasedOn chain (base-most applied first so nearer styles override their bases).
+        /// </summary>
+        private static Dictionary<string, string> ResolveStyleSetters(
+            ElementFrame element,
+            List<ElementFrame> scope,
+            IXamlTypeResolver typeResolver,
+            IReadOnlyDictionary<string, string> namespaces)
+        {
+            var setters = new Dictionary<string, string>(StringComparer.Ordinal);
+
+            // Direct styles win: inline, then Style="{StaticResource}". Only when neither is set do
+            // we consider an implicit keyless style matched by TargetType.
+            var hasDirectStyle = element.InlineStyle is not null || element.StyleStaticResourceKey is not null;
+            var style = element.InlineStyle;
+            if (style is null && element.StyleStaticResourceKey is not null)
+                style = FindKeyedStyle(scope, 0, element.StyleStaticResourceKey);
+            if (style is null && !hasDirectStyle && element.ResolvedType is not null)
+                style = FindImplicitStyle(scope, 0, element.ResolvedType, typeResolver, namespaces);
+            if (style is null)
+                return setters;
+
+            // Walk the BasedOn chain from the chosen (most-derived) style to its bases.
+            var chain = new List<StyleInfo>();
+            var current = style;
+            var guard = 0;
+            while (current is not null && guard++ < 64)
+            {
+                chain.Add(current);
+                if (current.BasedOnKey is null)
+                    break;
+                var startIndex = scope.IndexOf(current.Owner);
+                if (startIndex < 0)
+                    startIndex = 0;
+                current = FindKeyedStyle(scope, startIndex, current.BasedOnKey);
+            }
+
+            // Apply base-most first so a derived style's setters override its base's, and within a
+            // style later setters override earlier ones.
+            for (var i = chain.Count - 1; i >= 0; i--)
+                foreach (var setter in chain[i].Setters)
+                    setters[setter.Key] = setter.Value;
+
+            return setters;
+        }
+
+        private static StyleInfo? FindKeyedStyle(List<ElementFrame> scope, int startIndex, string key)
+        {
+            for (var i = startIndex; i < scope.Count; i++)
+            {
+                var keyed = scope[i].KeyedStyles;
+                if (keyed is not null && keyed.TryGetValue(key, out var style))
+                    return style;
+            }
+            return null;
+        }
+
+        private static StyleInfo? FindImplicitStyle(
+            List<ElementFrame> scope,
+            int startIndex,
+            XamlElementType elementType,
+            IXamlTypeResolver typeResolver,
+            IReadOnlyDictionary<string, string> namespaces)
+        {
+            for (var i = startIndex; i < scope.Count; i++)
+            {
+                var implicitStyles = scope[i].ImplicitStyles;
+                if (implicitStyles is null)
+                    continue;
+                foreach (var style in implicitStyles)
+                {
+                    var targetType = ResolveQualifiedType(style.TargetTypeName, namespaces, typeResolver);
+                    if (targetType is not null && targetType == elementType)
+                        return style;
+                }
+            }
+            return null;
+        }
+
+        /// <summary>Resolves a possibly prefixed XAML type name (e.g. "Slider" or "ctl:MyControl").</summary>
+        private static XamlElementType? ResolveQualifiedType(
+            string? qualifiedName,
+            IReadOnlyDictionary<string, string> namespaces,
+            IXamlTypeResolver typeResolver)
+        {
+            if (string.IsNullOrEmpty(qualifiedName))
+                return null;
+
+            var qualified = qualifiedName!;
+            var prefix = string.Empty;
+            var name = qualified;
+            var colon = qualified.IndexOf(':');
+            if (colon >= 0)
+            {
+                prefix = qualified.Substring(0, colon);
+                name = qualified.Substring(colon + 1);
+            }
+
+            return namespaces.TryGetValue(prefix, out var xmlns)
+                ? typeResolver.Resolve(xmlns, name)
+                : null;
         }
 
         private enum MarkupKind
@@ -339,10 +536,30 @@ namespace XamlUtils
             public string? Value { get; }
         }
 
+        /// <summary>A WPF Style collected while parsing: its key/target/BasedOn and its setters.</summary>
+        private sealed class StyleInfo
+        {
+            public StyleInfo(ElementFrame owner, bool isInline)
+            {
+                Owner = owner;
+                IsInline = isInline;
+            }
+
+            /// <summary>The element whose resources or Style member defines this style (BasedOn search origin).</summary>
+            public ElementFrame Owner { get; }
+
+            /// <summary>True for an inline <c>&lt;Element.Style&gt;</c> (vs. a resource style).</summary>
+            public bool IsInline { get; }
+
+            public string? Key { get; set; }
+            public string? TargetTypeName { get; set; }
+            public string? BasedOnKey { get; set; }
+            public List<KeyValuePair<string, string>> Setters { get; } = new List<KeyValuePair<string, string>>();
+        }
+
         /// <summary>
-        /// Tracks the state of one open XAML element while streaming: which rules it matched, which
-        /// member values to capture, where its name sits, captured values, resource scope, and any
-        /// markup-extension/resource-entry bookkeeping.
+        /// Tracks the state of one open XAML object while streaming: rule matches, captured member
+        /// values, resource/style scope, and markup-extension / resource-entry / style bookkeeping.
         /// </summary>
         private sealed class ElementFrame
         {
@@ -367,24 +584,47 @@ namespace XamlUtils
             public int LinePosition { get; }
             public string ElementName { get; }
 
-            // When this frame is an {x:Static}/{StaticResource} markup extension supplying the value
-            // of a wanted member, these identify the element/member whose value it should populate.
+            /// <summary>The element's resolved CLR type (used for implicit-style TargetType matching).</summary>
+            public XamlElementType? ResolvedType { get; set; }
+
+            // {x:Static}/{StaticResource} supplying the value of a wanted member: where to populate.
             public MarkupKind MarkupKind { get; set; }
             public ElementFrame? MarkupTargetFrame { get; set; }
             public string? MarkupTargetMember { get; set; }
 
-            // Resources declared in this element's <Element.Resources>, keyed by x:Key. Only set for
-            // elements that actually have a resources section; in scope until this frame is popped.
+            // Resources / styles declared in this element's <Element.Resources>, in scope until popped.
             public Dictionary<string, ResourceEntry>? Resources { get; set; }
+            public Dictionary<string, StyleInfo>? KeyedStyles { get; set; }
+            public List<StyleInfo>? ImplicitStyles { get; set; }
 
-            // Set on a resource-dictionary scope: the element that owns it.
+            // The element's own style (inline) or the key of its Style="{StaticResource}".
+            public StyleInfo? InlineStyle { get; set; }
+            public string? StyleStaticResourceKey { get; set; }
+
+            // Set on a (implicit/explicit) resource-dictionary scope: the element that owns it.
             public ElementFrame? ResourceDictOwner { get; set; }
+
+            // Set on the scope backing an element's Style member (inline style): the owning element.
+            public ElementFrame? StyleMemberOwner { get; set; }
 
             // Set on a resource-entry object while it is being read, then committed to the owner.
             public ElementFrame? ResourceEntryOwner { get; set; }
             public bool ResourceEntryIsPrimitive { get; set; }
             public string? ResourceEntryKey { get; set; }
             public string? ResourceEntryValue { get; set; }
+
+            // Set on a Style object while it is being built; committed at its EndObject.
+            public StyleInfo? StyleBuilding { get; set; }
+
+            // Set on a Setter object while it is being read; committed to its style.
+            public StyleInfo? SetterTargetStyle { get; set; }
+            public string? SetterProperty { get; set; }
+            public string? SetterValue { get; set; }
+
+            // Markup-extension frames that feed a style's fields rather than a member value.
+            public ElementFrame? StyleKeySinkFrame { get; set; }   // Style="{StaticResource key}"
+            public StyleInfo? StyleBasedOnSink { get; set; }       // BasedOn="{StaticResource key}"
+            public StyleInfo? StyleTargetTypeSink { get; set; }    // TargetType="{x:Type name}"
         }
     }
 
