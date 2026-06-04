@@ -1,0 +1,16 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- Portable.Xaml provides XamlXmlReader without the System.Xaml/WindowsDesktop dependency,
+         so this library is netstandard2.0 and can be referenced (and run in-process) by a Roslyn
+         analyzer for live, cross-platform analysis. LangVersion is bumped so nullable works. -->
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Portable.Xaml" Version="0.26.0" />
+  </ItemGroup>
+
+</Project>
