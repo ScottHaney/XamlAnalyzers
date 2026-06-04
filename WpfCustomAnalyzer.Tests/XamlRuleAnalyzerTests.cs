@@ -10,6 +10,7 @@ using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.Diagnostics;
 using Microsoft.CodeAnalysis.Text;
 using WpfCustomAnalyzer;
+using XamlUtils;
 using Xunit;
 
 namespace WpfCustomAnalyzer.Tests;
@@ -83,6 +84,75 @@ public class XamlRuleAnalyzerTests
         var message = diagnostic.GetMessage();
         Assert.Contains("Minimum=42", message);   // evaluated from x:Static
         Assert.Contains("Maximum=10", message);
+    }
+
+    // {StaticResource} pointing at an int resource (=1) declared in the Slider's parent's
+    // resources should resolve to that primitive value.
+    [Fact]
+    public async Task Resolves_StaticResource_From_Ancestor_Resources()
+    {
+        var xaml =
+            $"<StackPanel xmlns=\"{PresentationXmlns}\"\n" +
+            "            xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\"\n" +
+            "            xmlns:sys=\"clr-namespace:System;assembly=System.Runtime\">\n" +
+            "  <StackPanel.Resources>\n" +
+            "    <sys:Int32 x:Key=\"myMin\">1</sys:Int32>\n" +
+            "  </StackPanel.Resources>\n" +
+            "  <Slider Minimum=\"{StaticResource myMin}\" Maximum=\"2\" />\n" +
+            "</StackPanel>";
+
+        var diagnostics = await RunAnalyzerAsync(xaml);
+
+        var diagnostic = Assert.Single(diagnostics);
+        var message = diagnostic.GetMessage();
+        Assert.Contains("Minimum=1", message);
+        Assert.Contains("Maximum=2", message);
+    }
+
+    // The resource lives in a *sibling* (Button) of the Slider, not an ancestor, so by the time the
+    // Slider is read the Button scope is closed and the lookup must fail to the invalid marker.
+    [Fact]
+    public async Task StaticResource_From_NonAncestor_Sibling_Is_Invalid()
+    {
+        var xaml =
+            $"<StackPanel xmlns=\"{PresentationXmlns}\"\n" +
+            "            xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\"\n" +
+            "            xmlns:sys=\"clr-namespace:System;assembly=System.Runtime\">\n" +
+            "  <Button>\n" +
+            "    <Button.Resources>\n" +
+            "      <sys:Int32 x:Key=\"myMin\">1</sys:Int32>\n" +
+            "    </Button.Resources>\n" +
+            "  </Button>\n" +
+            "  <Slider Minimum=\"{StaticResource myMin}\" Maximum=\"2\" />\n" +
+            "</StackPanel>";
+
+        var diagnostics = await RunAnalyzerAsync(xaml);
+
+        var diagnostic = Assert.Single(diagnostics);
+        var message = diagnostic.GetMessage();
+        Assert.Contains($"Minimum={XamlParser.InvalidResourceValue}", message);
+        Assert.Contains("Maximum=2", message);
+    }
+
+    // The resource is found but isn't a primitive int/double/string, so it resolves to the marker.
+    [Fact]
+    public async Task StaticResource_Of_Complex_Type_Is_Invalid()
+    {
+        var xaml =
+            $"<StackPanel xmlns=\"{PresentationXmlns}\"\n" +
+            "            xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\">\n" +
+            "  <StackPanel.Resources>\n" +
+            "    <Button x:Key=\"complexRes\" />\n" +
+            "  </StackPanel.Resources>\n" +
+            "  <Slider Minimum=\"{StaticResource complexRes}\" Maximum=\"2\" />\n" +
+            "</StackPanel>";
+
+        var diagnostics = await RunAnalyzerAsync(xaml);
+
+        var diagnostic = Assert.Single(diagnostics);
+        var message = diagnostic.GetMessage();
+        Assert.Contains($"Minimum={XamlParser.InvalidResourceValue}", message);
+        Assert.Contains("Maximum=2", message);
     }
 
     // Button is not a configured rule, so nothing should be reported.

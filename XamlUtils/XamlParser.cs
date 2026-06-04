@@ -10,6 +10,13 @@ namespace XamlUtils
         // The XAML language namespace (the "x:" prefix), where StaticExtension (x:Static) lives.
         private const string XamlLanguageNamespace = "http://schemas.microsoft.com/winfx/2006/xaml";
 
+        /// <summary>
+        /// Value placed in <see cref="RuleViolationResult.ExtractedProperties"/> for a
+        /// {StaticResource} whose key can't be found in an ancestor's resources, or whose resource is
+        /// not a primitive int/double/string.
+        /// </summary>
+        public const string InvalidResourceValue = "_INVALID_VALUE_";
+
 
         /// <summary>
         /// Convenience overload that resolves XAML elements to CLR types by reflecting over the
@@ -81,23 +88,32 @@ namespace XamlUtils
                     {
                         var xamlType = reader.Type;
 
-                        // Detect an {x:Static} markup extension sitting as the value of a member we
-                        // want to extract, so its referenced static value can be captured below.
-                        ElementFrame? staticTargetFrame = null;
-                        string? staticTargetMember = null;
-                        if (xamlType is not null
-                            && xamlType.Name == "StaticExtension"
-                            && xamlType.PreferredXamlNamespace == XamlLanguageNamespace
-                            && objectStack.Count > 0 && memberStack.Count > 0)
+                        // Markup extensions that supply a member value: {x:Static ...} and
+                        // {StaticResource ...}. When one is the value of a member we want to extract,
+                        // remember which element/member it should populate (resolved at its Value).
+                        var markupKind = MarkupKindOf(xamlType);
+                        ElementFrame? markupTargetFrame = null;
+                        string? markupTargetMember = null;
+                        if (markupKind != MarkupKind.None && objectStack.Count > 0 && memberStack.Count > 0)
                         {
                             var parentFrame = objectStack.Peek();
                             var parentMember = memberStack.Peek();
                             if (parentFrame.WantedProps is not null && parentFrame.WantedProps.Contains(parentMember))
                             {
-                                staticTargetFrame = parentFrame;
-                                staticTargetMember = parentMember;
+                                markupTargetFrame = parentFrame;
+                                markupTargetMember = parentMember;
                             }
                         }
+
+                        // An explicit <ResourceDictionary> written directly inside an
+                        // <Element.Resources> is the resource dictionary for that element.
+                        ElementFrame? resourceDictOwner = null;
+                        if (objectStack.Count > 0 && memberStack.Count > 0 && memberStack.Peek() == ResourcesMember)
+                            resourceDictOwner = objectStack.Peek();
+
+                        // An object sitting directly inside a resource dictionary is a resource entry
+                        // belonging to that dictionary's owner element.
+                        var resourceEntryOwner = objectStack.Count > 0 ? objectStack.Peek().ResourceDictOwner : null;
 
                         var clrType = xamlType is null
                             ? null
@@ -129,17 +145,27 @@ namespace XamlUtils
                             lineInfo.LinePosition,
                             xamlType?.Name ?? string.Empty)
                         {
-                            StaticTargetFrame = staticTargetFrame,
-                            StaticTargetMember = staticTargetMember,
+                            MarkupKind = markupKind,
+                            MarkupTargetFrame = markupTargetFrame,
+                            MarkupTargetMember = markupTargetMember,
+                            ResourceDictOwner = resourceDictOwner,
+                            ResourceEntryOwner = resourceEntryOwner,
+                            ResourceEntryIsPrimitive = resourceEntryOwner is not null && IsPrimitiveResourceType(xamlType),
                         });
                         break;
                     }
 
                     case XamlNodeType.GetObject:
-                        // An implicit object (e.g. a pre-existing collection being appended to)
-                        // still opens a scope we must balance, but is never a rule target.
-                        objectStack.Push(ElementFrame.Ignored);
+                    {
+                        // A "get" object — e.g. the implicit ResourceDictionary behind
+                        // <Element.Resources>. If it backs a Resources member, record the element
+                        // that owns it so the entries inside can be attributed to that element.
+                        var getFrame = new ElementFrame(null, null, 0, 0, string.Empty);
+                        if (objectStack.Count > 0 && memberStack.Count > 0 && memberStack.Peek() == ResourcesMember)
+                            getFrame.ResourceDictOwner = objectStack.Peek();
+                        objectStack.Push(getFrame);
                         break;
+                    }
 
                     case XamlNodeType.StartMember:
                         memberStack.Push(reader.Member?.Name ?? string.Empty);
@@ -153,15 +179,34 @@ namespace XamlUtils
                             var frame = objectStack.Peek();
                             var member = memberStack.Peek();
 
-                            if (frame.StaticTargetFrame is not null
-                                && frame.StaticTargetMember is not null
+                            if (frame.MarkupKind != MarkupKind.None
+                                && frame.MarkupTargetFrame is not null
+                                && frame.MarkupTargetMember is not null
                                 && (member == "_PositionalParameters" || member == "Member")
-                                && reader.Value is string staticExpression)
+                                && reader.Value is string markupArgument)
                             {
-                                // This is the argument of an {x:Static} for a wanted member; evaluate
-                                // the referenced static member and store it on the target element.
-                                if (StaticMemberValues.TryResolve(typeResolver, namespaces, staticExpression, out var staticValue))
-                                    frame.StaticTargetFrame.Captured[frame.StaticTargetMember] = staticValue;
+                                if (frame.MarkupKind == MarkupKind.XStatic)
+                                {
+                                    // {x:Static}: evaluate the static member. On failure leave the
+                                    // member to its other fallbacks (DP default, etc.).
+                                    if (StaticMemberValues.TryResolve(typeResolver, namespaces, markupArgument, out var staticValue))
+                                        frame.MarkupTargetFrame.Captured[frame.MarkupTargetMember] = staticValue;
+                                }
+                                else // StaticResource
+                                {
+                                    // {StaticResource}: search the ancestor chain for the keyed
+                                    // resource. A miss or a non-primitive value yields the marker.
+                                    frame.MarkupTargetFrame.Captured[frame.MarkupTargetMember] =
+                                        ResolveStaticResource(objectStack, markupArgument);
+                                }
+                            }
+                            else if (frame.ResourceEntryOwner is not null && reader.Value is not null)
+                            {
+                                // Collecting a resource entry's x:Key and its primitive text value.
+                                if (member == "Key")
+                                    frame.ResourceEntryKey = reader.Value.ToString();
+                                else if (member == "_Initialization")
+                                    frame.ResourceEntryValue = reader.Value.ToString();
                             }
                             else if (frame.WantedProps is not null
                                 && frame.WantedProps.Contains(member)
@@ -184,6 +229,18 @@ namespace XamlUtils
                             break;
 
                         var frame = objectStack.Pop();
+
+                        // Commit a finished resource entry to its owning element's resources, so it
+                        // is visible to {StaticResource} lookups from that element and its descendants
+                        // (and goes out of scope now that this owner-or-deeper scope is closing).
+                        if (frame.ResourceEntryOwner is not null && frame.ResourceEntryKey is not null)
+                        {
+                            var owner = frame.ResourceEntryOwner;
+                            owner.Resources ??= new Dictionary<string, ResourceEntry>(StringComparer.Ordinal);
+                            owner.Resources[frame.ResourceEntryKey] =
+                                new ResourceEntry(frame.ResourceEntryIsPrimitive, frame.ResourceEntryValue);
+                        }
+
                         if (frame.MatchedRules is null)
                             break;
 
@@ -215,15 +272,80 @@ namespace XamlUtils
             return results;
         }
 
+        /// <summary>The XAML member exposing a WPF resource dictionary (<c>FrameworkElement.Resources</c>).</summary>
+        private const string ResourcesMember = "Resources";
+
+        private static MarkupKind MarkupKindOf(XamlType? type)
+        {
+            if (type is null)
+                return MarkupKind.None;
+            if (type.Name == "StaticExtension" && type.PreferredXamlNamespace == XamlLanguageNamespace)
+                return MarkupKind.XStatic;
+            if (type.Name == "StaticResource" || type.Name == "StaticResourceExtension")
+                return MarkupKind.StaticResource;
+            return MarkupKind.None;
+        }
+
+        /// <summary>True for the primitive resource types we know how to stringify: int, double, string.</summary>
+        private static bool IsPrimitiveResourceType(XamlType? type)
+        {
+            switch (type?.Name)
+            {
+                case "Int32":
+                case "Double":
+                case "String":
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
         /// <summary>
-        /// Tracks the state of one open XAML element while streaming: which rules it matched,
-        /// which member values to capture, where its name sits, and the captured values.
+        /// Resolves a {StaticResource} by walking the open element scopes from nearest ancestor to
+        /// the root (anything not an ancestor has already been popped, so isn't visible). Returns the
+        /// primitive resource's string value, or <see cref="InvalidResourceValue"/> when the key is
+        /// not found or the resource isn't a primitive int/double/string.
+        /// </summary>
+        private static string ResolveStaticResource(Stack<ElementFrame> objectStack, string key)
+        {
+            foreach (var frame in objectStack)
+            {
+                if (frame.Resources is not null && frame.Resources.TryGetValue(key, out var entry))
+                    return entry.IsPrimitive && entry.Value is not null ? entry.Value : InvalidResourceValue;
+            }
+            return InvalidResourceValue;
+        }
+
+        private enum MarkupKind
+        {
+            None,
+            XStatic,
+            StaticResource,
+        }
+
+        /// <summary>A resource collected from an <c>&lt;Element.Resources&gt;</c> section.</summary>
+        private readonly struct ResourceEntry
+        {
+            public ResourceEntry(bool isPrimitive, string? value)
+            {
+                IsPrimitive = isPrimitive;
+                Value = value;
+            }
+
+            /// <summary>True when the resource is an int/double/string (so <see cref="Value"/> is usable).</summary>
+            public bool IsPrimitive { get; }
+
+            /// <summary>The primitive resource's text value, if any.</summary>
+            public string? Value { get; }
+        }
+
+        /// <summary>
+        /// Tracks the state of one open XAML element while streaming: which rules it matched, which
+        /// member values to capture, where its name sits, captured values, resource scope, and any
+        /// markup-extension/resource-entry bookkeeping.
         /// </summary>
         private sealed class ElementFrame
         {
-            /// <summary>Shared frame for object scopes that can never match a rule.</summary>
-            public static readonly ElementFrame Ignored = new(null, null, 0, 0, string.Empty);
-
             public ElementFrame(
                 List<XamlRule>? matchedRules,
                 HashSet<string>? wantedProps,
@@ -245,10 +367,24 @@ namespace XamlUtils
             public int LinePosition { get; }
             public string ElementName { get; }
 
-            // When this frame is an {x:Static} markup extension that supplies the value of a wanted
-            // member, these point at the element/member whose value it should populate.
-            public ElementFrame? StaticTargetFrame { get; set; }
-            public string? StaticTargetMember { get; set; }
+            // When this frame is an {x:Static}/{StaticResource} markup extension supplying the value
+            // of a wanted member, these identify the element/member whose value it should populate.
+            public MarkupKind MarkupKind { get; set; }
+            public ElementFrame? MarkupTargetFrame { get; set; }
+            public string? MarkupTargetMember { get; set; }
+
+            // Resources declared in this element's <Element.Resources>, keyed by x:Key. Only set for
+            // elements that actually have a resources section; in scope until this frame is popped.
+            public Dictionary<string, ResourceEntry>? Resources { get; set; }
+
+            // Set on a resource-dictionary scope: the element that owns it.
+            public ElementFrame? ResourceDictOwner { get; set; }
+
+            // Set on a resource-entry object while it is being read, then committed to the owner.
+            public ElementFrame? ResourceEntryOwner { get; set; }
+            public bool ResourceEntryIsPrimitive { get; set; }
+            public string? ResourceEntryKey { get; set; }
+            public string? ResourceEntryValue { get; set; }
         }
     }
 
