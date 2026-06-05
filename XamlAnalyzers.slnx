@@ -2,5 +2,6 @@
   <Project Path="WpfCustomAnalyzer.CodeFixes/WpfCustomAnalyzer.CodeFixes.csproj" />
   <Project Path="WpfCustomAnalyzer.Tests/WpfCustomAnalyzer.Tests.csproj" />
   <Project Path="WpfCustomAnalyzer/WpfCustomAnalyzer.csproj" />
+  <Project Path="XamlRulesContracts/XamlRulesContracts.csproj" />
   <Project Path="XamlUtils/XamlUtils.csproj" Id="c7f43eba-d752-45a6-81b7-53df4a046f99" />
 </Solution>

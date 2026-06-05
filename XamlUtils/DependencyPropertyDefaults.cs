@@ -2,6 +2,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Globalization;
 using System.Reflection;
+using XamlRules;
 
 namespace XamlUtils
 {

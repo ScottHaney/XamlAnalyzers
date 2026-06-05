@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.IO;
 using System.Linq;
@@ -10,6 +11,7 @@ using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.Diagnostics;
 using Microsoft.CodeAnalysis.Text;
 using WpfCustomAnalyzer;
+using XamlRules;
 using XamlUtils;
 using Xunit;
 
@@ -20,78 +22,53 @@ public class XamlRuleAnalyzerTests
     private const string PresentationXmlns =
         "http://schemas.microsoft.com/winfx/2006/xaml/presentation";
 
-    // Slider is a configured rule; it should be flagged and its Minimum/Maximum extracted.
-    // Both attribute syntaxes are used to prove they are handled identically.
+    // ---- XamlParser extraction behaviour (tested directly, the level it belongs at) ----
+
+    // Minimum (inline attribute) and Maximum (property element) extract identically.
     [Fact]
-    public async Task Flags_Slider_And_Extracts_Props_From_Both_Syntaxes()
+    public void Extracts_Props_From_Both_Attribute_Syntaxes()
     {
-        var xaml =
+        var props = ExtractSlider(
             $"<Window xmlns=\"{PresentationXmlns}\">\n" +
             "  <Slider Minimum=\"3\">\n" +
             "    <Slider.Maximum>10</Slider.Maximum>\n" +
             "  </Slider>\n" +
-            "</Window>";
+            "</Window>");
 
-        var diagnostics = await RunAnalyzerAsync(xaml);
-
-        var diagnostic = Assert.Single(diagnostics);
-        Assert.Equal(XamlRuleAnalyzer.DiagnosticId, diagnostic.Id);
-
-        var message = diagnostic.GetMessage();
-        Assert.Contains("Slider", message);
-        Assert.Contains("Minimum=3", message);
-        Assert.Contains("Maximum=10", message);
-
-        // Squiggle should sit on the element name: line 2, column 4 (1-based) == (1, 3) 0-based.
-        var lineSpan = diagnostic.Location.GetLineSpan();
-        Assert.Equal(new LinePosition(1, 3), lineSpan.StartLinePosition);
-        Assert.Equal(new LinePosition(1, 3 + "Slider".Length), lineSpan.EndLinePosition);
+        Assert.Equal("3", props["Minimum"].Value);
+        Assert.Equal("10", props["Maximum"].Value);
     }
 
-    // Neither Minimum nor Maximum is set in the markup. Both are Slider dependency properties, so
-    // their extracted values should fall back to the registered DP defaults: Minimum=0, Maximum=1.
+    // Missing properties fall back to the dependency-property defaults (Minimum=0, Maximum=1).
     [Fact]
-    public async Task Fills_Missing_DependencyProperties_With_Their_Defaults()
+    public void Fills_Missing_DependencyProperties_With_Their_Defaults()
     {
-        var xaml =
-            $"<Window xmlns=\"{PresentationXmlns}\">\n" +
-            "  <Slider />\n" +
-            "</Window>";
+        var props = ExtractSlider($"<Window xmlns=\"{PresentationXmlns}\"><Slider /></Window>");
 
-        var diagnostics = await RunAnalyzerAsync(xaml);
-
-        var diagnostic = Assert.Single(diagnostics);
-        var message = diagnostic.GetMessage();
-        Assert.Contains("Minimum=0", message);   // dependency-property default
-        Assert.Contains("Maximum=1", message);   // dependency-property default
+        Assert.Equal("0", props["Minimum"].Value);
+        Assert.Equal("1", props["Maximum"].Value);
     }
 
-    // Minimum is set via {x:Static}. The analyzer should evaluate the referenced static member
-    // (StaticValues.SliderMinimum == 42) the way x:Static does and use that as the value.
+    // {x:Static} is evaluated by reflection (StaticValues.SliderMinimum == 42).
     [Fact]
-    public async Task Resolves_xStatic_Value_Via_Reflection()
+    public void Resolves_xStatic_Value_Via_Reflection()
     {
-        var xaml =
+        var props = ExtractSlider(
             $"<Window xmlns=\"{PresentationXmlns}\"\n" +
             "        xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\"\n" +
             "        xmlns:local=\"clr-namespace:WpfCustomAnalyzer.Tests;assembly=WpfCustomAnalyzer.Tests\">\n" +
             "  <Slider Minimum=\"{x:Static local:StaticValues.SliderMinimum}\" Maximum=\"10\" />\n" +
-            "</Window>";
+            "</Window>");
 
-        var diagnostics = await RunAnalyzerAsync(xaml);
-
-        var diagnostic = Assert.Single(diagnostics);
-        var message = diagnostic.GetMessage();
-        Assert.Contains("Minimum=42", message);   // evaluated from x:Static
-        Assert.Contains("Maximum=10", message);
+        Assert.Equal("42", props["Minimum"].Value);
+        Assert.Equal("10", props["Maximum"].Value);
     }
 
-    // {StaticResource} pointing at an int resource (=1) declared in the Slider's parent's
-    // resources should resolve to that primitive value.
+    // {StaticResource} resolves a primitive int declared in an ancestor's resources.
     [Fact]
-    public async Task Resolves_StaticResource_From_Ancestor_Resources()
+    public void Resolves_StaticResource_From_Ancestor_Resources()
     {
-        var xaml =
+        var props = ExtractSlider(
             $"<StackPanel xmlns=\"{PresentationXmlns}\"\n" +
             "            xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\"\n" +
             "            xmlns:sys=\"clr-namespace:System;assembly=System.Runtime\">\n" +
@@ -99,87 +76,63 @@ public class XamlRuleAnalyzerTests
             "    <sys:Int32 x:Key=\"myMin\">1</sys:Int32>\n" +
             "  </StackPanel.Resources>\n" +
             "  <Slider Minimum=\"{StaticResource myMin}\" Maximum=\"2\" />\n" +
-            "</StackPanel>";
+            "</StackPanel>");
 
-        var diagnostics = await RunAnalyzerAsync(xaml);
-
-        var diagnostic = Assert.Single(diagnostics);
-        var message = diagnostic.GetMessage();
-        Assert.Contains("Minimum=1", message);
-        Assert.Contains("Maximum=2", message);
+        Assert.Equal("1", props["Minimum"].Value);
+        Assert.Equal("2", props["Maximum"].Value);
     }
 
-    // The resource lives in a *sibling* (Button) of the Slider, not an ancestor, so by the time the
-    // Slider is read the Button scope is closed and the lookup must fail to the invalid marker.
+    // A resource in a sibling (not an ancestor) is out of scope -> invalid marker.
     [Fact]
-    public async Task StaticResource_From_NonAncestor_Sibling_Is_Invalid()
+    public void StaticResource_From_NonAncestor_Sibling_Is_Invalid()
     {
-        var xaml =
+        var props = ExtractSlider(
             $"<StackPanel xmlns=\"{PresentationXmlns}\"\n" +
             "            xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\"\n" +
             "            xmlns:sys=\"clr-namespace:System;assembly=System.Runtime\">\n" +
-            "  <Button>\n" +
-            "    <Button.Resources>\n" +
-            "      <sys:Int32 x:Key=\"myMin\">1</sys:Int32>\n" +
-            "    </Button.Resources>\n" +
-            "  </Button>\n" +
+            "  <Button><Button.Resources><sys:Int32 x:Key=\"myMin\">1</sys:Int32></Button.Resources></Button>\n" +
             "  <Slider Minimum=\"{StaticResource myMin}\" Maximum=\"2\" />\n" +
-            "</StackPanel>";
+            "</StackPanel>");
 
-        var diagnostics = await RunAnalyzerAsync(xaml);
-
-        var diagnostic = Assert.Single(diagnostics);
-        var message = diagnostic.GetMessage();
-        Assert.Contains($"Minimum={XamlParser.InvalidResourceValue}", message);
-        Assert.Contains("Maximum=2", message);
+        Assert.Equal(XamlParser.InvalidResourceValue, props["Minimum"].Value);
+        Assert.Equal("2", props["Maximum"].Value);
     }
 
-    // The resource is found but isn't a primitive int/double/string, so it resolves to the marker.
+    // A found-but-non-primitive resource resolves to the invalid marker.
     [Fact]
-    public async Task StaticResource_Of_Complex_Type_Is_Invalid()
+    public void StaticResource_Of_Complex_Type_Is_Invalid()
     {
-        var xaml =
+        var props = ExtractSlider(
             $"<StackPanel xmlns=\"{PresentationXmlns}\"\n" +
             "            xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\">\n" +
-            "  <StackPanel.Resources>\n" +
-            "    <Button x:Key=\"complexRes\" />\n" +
-            "  </StackPanel.Resources>\n" +
+            "  <StackPanel.Resources><Button x:Key=\"complexRes\" /></StackPanel.Resources>\n" +
             "  <Slider Minimum=\"{StaticResource complexRes}\" Maximum=\"2\" />\n" +
-            "</StackPanel>";
+            "</StackPanel>");
 
-        var diagnostics = await RunAnalyzerAsync(xaml);
-
-        var diagnostic = Assert.Single(diagnostics);
-        var message = diagnostic.GetMessage();
-        Assert.Contains($"Minimum={XamlParser.InvalidResourceValue}", message);
-        Assert.Contains("Maximum=2", message);
+        Assert.Equal(XamlParser.InvalidResourceValue, props["Minimum"].Value);
     }
 
     // An inline <Slider.Style> setter supplies Minimum; Maximum falls back to its DP default.
     [Fact]
-    public async Task Resolves_Property_From_Inline_Style_Setter()
+    public void Resolves_Property_From_Inline_Style_Setter()
     {
-        var xaml =
+        var props = ExtractSlider(
             $"<Slider xmlns=\"{PresentationXmlns}\"\n" +
             "        xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\">\n" +
             "  <Slider.Style>\n" +
             "    <Style TargetType=\"Slider\"><Setter Property=\"Minimum\" Value=\"3\"/></Style>\n" +
             "  </Slider.Style>\n" +
-            "</Slider>";
+            "</Slider>");
 
-        var diagnostics = await RunAnalyzerAsync(xaml);
-
-        var message = Assert.Single(diagnostics).GetMessage();
-        Assert.Contains("Minimum=3", message);
-        Assert.Contains("Maximum=1", message); // DP default
+        Assert.Equal("3", props["Minimum"].Value);
+        Assert.Equal("1", props["Maximum"].Value);
     }
 
-    // Style="{StaticResource}" plus a BasedOn chain: Minimum from the derived style, Maximum
-    // inherited from the base style it is BasedOn.
+    // Style="{StaticResource}" + BasedOn: Minimum from derived, Maximum inherited from base.
     [Fact]
-    public async Task Resolves_Style_Via_StaticResource_With_BasedOn_Inheritance()
+    public void Resolves_Style_Via_StaticResource_With_BasedOn_Inheritance()
     {
-        var xaml =
+        var props = ExtractSlider(
             $"<StackPanel xmlns=\"{PresentationXmlns}\"\n" +
             "            xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\">\n" +
             "  <StackPanel.Resources>\n" +
@@ -189,20 +142,17 @@ public class XamlRuleAnalyzerTests
             "    </Style>\n" +
             "  </StackPanel.Resources>\n" +
             "  <Slider Style=\"{StaticResource derived}\" />\n" +
-            "</StackPanel>";
+            "</StackPanel>");
 
-        var diagnostics = await RunAnalyzerAsync(xaml);
-
-        var message = Assert.Single(diagnostics).GetMessage();
-        Assert.Contains("Minimum=5", message);
-        Assert.Contains("Maximum=50", message);
+        Assert.Equal("5", props["Minimum"].Value);
+        Assert.Equal("50", props["Maximum"].Value);
     }
 
-    // A derived style's setter overrides the same property set by the style it is BasedOn.
+    // A derived style's setter overrides the same property set by its base.
     [Fact]
-    public async Task Derived_Style_Setter_Overrides_Base()
+    public void Derived_Style_Setter_Overrides_Base()
     {
-        var xaml =
+        var props = ExtractSlider(
             $"<StackPanel xmlns=\"{PresentationXmlns}\"\n" +
             "            xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\">\n" +
             "  <StackPanel.Resources>\n" +
@@ -214,58 +164,45 @@ public class XamlRuleAnalyzerTests
             "    </Style>\n" +
             "  </StackPanel.Resources>\n" +
             "  <Slider Style=\"{StaticResource derived}\" />\n" +
-            "</StackPanel>";
+            "</StackPanel>");
 
-        var diagnostics = await RunAnalyzerAsync(xaml);
-
-        var message = Assert.Single(diagnostics).GetMessage();
-        Assert.Contains("Minimum=9", message); // derived overrides base's 1
-        Assert.Contains("Maximum=2", message); // from base
+        Assert.Equal("9", props["Minimum"].Value); // derived overrides base's 1
+        Assert.Equal("2", props["Maximum"].Value); // from base
     }
 
-    // A keyless implicit style whose TargetType matches applies when no Style is set on the element.
+    // A keyless implicit style applies by TargetType when no Style is set on the element.
     [Fact]
-    public async Task Implicit_Keyless_Style_Applies_By_TargetType()
+    public void Implicit_Keyless_Style_Applies_By_TargetType()
     {
-        var xaml =
+        var props = ExtractSlider(
             $"<StackPanel xmlns=\"{PresentationXmlns}\">\n" +
-            "  <StackPanel.Resources>\n" +
-            "    <Style TargetType=\"Slider\"><Setter Property=\"Minimum\" Value=\"4\"/></Style>\n" +
-            "  </StackPanel.Resources>\n" +
+            "  <StackPanel.Resources><Style TargetType=\"Slider\"><Setter Property=\"Minimum\" Value=\"4\"/></Style></StackPanel.Resources>\n" +
             "  <Slider />\n" +
-            "</StackPanel>";
+            "</StackPanel>");
 
-        var diagnostics = await RunAnalyzerAsync(xaml);
-
-        var message = Assert.Single(diagnostics).GetMessage();
-        Assert.Contains("Minimum=4", message);
-        Assert.Contains("Maximum=1", message); // DP default
+        Assert.Equal("4", props["Minimum"].Value);
+        Assert.Equal("1", props["Maximum"].Value);
     }
 
-    // {x:Type Slider} as a TargetType resolves the same as the bare "Slider" form.
+    // TargetType="{x:Type Slider}" matches the same as the bare "Slider" form.
     [Fact]
-    public async Task Implicit_Style_Matches_TargetType_Via_xType()
+    public void Implicit_Style_Matches_TargetType_Via_xType()
     {
-        var xaml =
+        var props = ExtractSlider(
             $"<StackPanel xmlns=\"{PresentationXmlns}\"\n" +
             "            xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\">\n" +
-            "  <StackPanel.Resources>\n" +
-            "    <Style TargetType=\"{x:Type Slider}\"><Setter Property=\"Minimum\" Value=\"6\"/></Style>\n" +
-            "  </StackPanel.Resources>\n" +
+            "  <StackPanel.Resources><Style TargetType=\"{x:Type Slider}\"><Setter Property=\"Minimum\" Value=\"6\"/></Style></StackPanel.Resources>\n" +
             "  <Slider />\n" +
-            "</StackPanel>";
+            "</StackPanel>");
 
-        var diagnostics = await RunAnalyzerAsync(xaml);
-
-        var message = Assert.Single(diagnostics).GetMessage();
-        Assert.Contains("Minimum=6", message);
+        Assert.Equal("6", props["Minimum"].Value);
     }
 
     // A directly-set Style suppresses any matching implicit (keyless) style.
     [Fact]
-    public async Task Direct_Style_Suppresses_Implicit_Style()
+    public void Direct_Style_Suppresses_Implicit_Style()
     {
-        var xaml =
+        var props = ExtractSlider(
             $"<StackPanel xmlns=\"{PresentationXmlns}\"\n" +
             "            xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\">\n" +
             "  <StackPanel.Resources>\n" +
@@ -273,32 +210,26 @@ public class XamlRuleAnalyzerTests
             "    <Style x:Key=\"explicitStyle\" TargetType=\"Slider\"><Setter Property=\"Maximum\" Value=\"7\"/></Style>\n" +
             "  </StackPanel.Resources>\n" +
             "  <Slider Style=\"{StaticResource explicitStyle}\" />\n" +
-            "</StackPanel>";
+            "</StackPanel>");
 
-        var diagnostics = await RunAnalyzerAsync(xaml);
-
-        var message = Assert.Single(diagnostics).GetMessage();
-        Assert.Contains("Maximum=7", message);   // from the explicit style
-        Assert.Contains("Minimum=0", message);   // DP default — the implicit style is ignored
+        Assert.Equal("7", props["Maximum"].Value);                            // from the explicit style
+        Assert.Equal("0", props["Minimum"].Value);                            // DP default; implicit ignored
+        Assert.Equal(PropertyValueSource.DefaultValue, props["Minimum"].Source);
     }
 
     // A value set directly on the element wins over the same property from its style.
     [Fact]
-    public async Task Direct_Value_Overrides_Style_Setter()
+    public void Direct_Value_Overrides_Style_Setter()
     {
-        var xaml =
+        var props = ExtractSlider(
             $"<StackPanel xmlns=\"{PresentationXmlns}\"\n" +
             "            xmlns:x=\"http://schemas.microsoft.com/winfx/2006/xaml\">\n" +
-            "  <StackPanel.Resources>\n" +
-            "    <Style x:Key=\"s\" TargetType=\"Slider\"><Setter Property=\"Minimum\" Value=\"5\"/></Style>\n" +
-            "  </StackPanel.Resources>\n" +
+            "  <StackPanel.Resources><Style x:Key=\"s\" TargetType=\"Slider\"><Setter Property=\"Minimum\" Value=\"5\"/></Style></StackPanel.Resources>\n" +
             "  <Slider Minimum=\"8\" Style=\"{StaticResource s}\" />\n" +
-            "</StackPanel>";
+            "</StackPanel>");
 
-        var diagnostics = await RunAnalyzerAsync(xaml);
-
-        var message = Assert.Single(diagnostics).GetMessage();
-        Assert.Contains("Minimum=8", message);   // direct value wins over the setter's 5
+        Assert.Equal("8", props["Minimum"].Value);
+        Assert.Equal(PropertyValueSource.LocalValue, props["Minimum"].Source);
     }
 
     // Each resolved property reports where its value came from (and NotValueFound -> null value).
@@ -315,48 +246,96 @@ public class XamlRuleAnalyzerTests
             "  <Slider />\n" +
             "</StackPanel>";
 
-        var resolver = new CompilationXamlTypeResolver(CreateWpfCompilation());
         var rule = new XamlRule(
             new XamlElementType("System.Windows.Controls", "Slider", "PresentationFramework"),
-            new[] { "Minimum", "Maximum", "NotAProp" });
-
-        var results = new XamlParser().ParseXaml(xaml, resolver, rule).ToList();
+            new[] { "Minimum", "Maximum", "NotAProp" },
+            _ => true);
+        var results = new XamlParser().ParseXaml(xaml, NewResolver(), rule).ToList();
 
         Assert.Equal(2, results.Count);
 
-        // First Slider: local value, style-setter value, and a property with no value anywhere.
         var first = results[0].ExtractedProperties;
         Assert.Equal(new PropertyValue("3", PropertyValueSource.LocalValue), first["Minimum"]);
         Assert.Equal(new PropertyValue("50", PropertyValueSource.StyleSetterValue), first["Maximum"]);
         Assert.Equal(new PropertyValue(null, PropertyValueSource.NotValueFound), first["NotAProp"]);
 
-        // Second (bare) Slider: both fall back to the dependency-property defaults.
         var second = results[1].ExtractedProperties;
         Assert.Equal(new PropertyValue("0", PropertyValueSource.DefaultValue), second["Minimum"]);
         Assert.Equal(new PropertyValue("1", PropertyValueSource.DefaultValue), second["Maximum"]);
         Assert.Equal(new PropertyValue(null, PropertyValueSource.NotValueFound), second["NotAProp"]);
     }
 
-    // Button is not a configured rule, so nothing should be reported.
-    [Fact]
-    public async Task Ignores_Elements_That_Match_No_Rule()
-    {
-        var xaml =
-            $"<Window xmlns=\"{PresentationXmlns}\">\n" +
-            "  <Button Content=\"Hi\" />\n" +
-            "</Window>";
+    // ---- XamlRuleAnalyzer (Minimum > Maximum) behaviour ----
 
-        var diagnostics = await RunAnalyzerAsync(xaml);
+    // A Slider whose Minimum exceeds its Maximum produces an XAML100 error on the element name.
+    [Fact]
+    public async Task Reports_Error_When_Minimum_Greater_Than_Maximum()
+    {
+        var diagnostics = await RunAnalyzerAsync($"<Slider xmlns=\"{PresentationXmlns}\" Minimum=\"5\" Maximum=\"2\" />");
+
+        var diagnostic = Assert.Single(diagnostics);
+        Assert.Equal(XamlRuleAnalyzer.DiagnosticId, diagnostic.Id);
+        Assert.Equal(DiagnosticSeverity.Error, diagnostic.Severity);
+
+        // Squiggle sits on the element name: "<Slider" -> name starts at column 2 (1-based) == 1.
+        var lineSpan = diagnostic.Location.GetLineSpan();
+        Assert.Equal(new LinePosition(0, 1), lineSpan.StartLinePosition);
+        Assert.Equal(new LinePosition(0, 1 + "Slider".Length), lineSpan.EndLinePosition);
+    }
+
+    // A valid range produces no diagnostic.
+    [Fact]
+    public async Task No_Diagnostic_When_Minimum_Not_Greater_Than_Maximum()
+    {
+        var diagnostics = await RunAnalyzerAsync($"<Slider xmlns=\"{PresentationXmlns}\" Minimum=\"2\" Maximum=\"5\" />");
 
         Assert.Empty(diagnostics);
     }
 
+    // The check uses resolved values: Minimum from a style (5) vs. Maximum's DP default (1) -> error.
+    [Fact]
+    public async Task Error_Uses_Resolved_Style_And_Default_Values()
+    {
+        var diagnostics = await RunAnalyzerAsync(
+            $"<StackPanel xmlns=\"{PresentationXmlns}\">\n" +
+            "  <StackPanel.Resources><Style TargetType=\"Slider\"><Setter Property=\"Minimum\" Value=\"5\"/></Style></StackPanel.Resources>\n" +
+            "  <Slider />\n" +
+            "</StackPanel>");
+
+        var diagnostic = Assert.Single(diagnostics);
+        Assert.Equal(XamlRuleAnalyzer.DiagnosticId, diagnostic.Id);
+    }
+
+    // Non-Slider elements are ignored.
+    [Fact]
+    public async Task Ignores_NonSlider_Elements()
+    {
+        var diagnostics = await RunAnalyzerAsync(
+            $"<Window xmlns=\"{PresentationXmlns}\"><Button Content=\"Hi\" /></Window>");
+
+        Assert.Empty(diagnostics);
+    }
+
+    // ---- helpers ----
+
+    private static IReadOnlyDictionary<string, PropertyValue> ExtractSlider(string xaml)
+    {
+        var rule = new XamlRule(
+            new XamlElementType("System.Windows.Controls", "Slider", "PresentationFramework"),
+            new[] { "Minimum", "Maximum" },
+            _ => true);
+        var results = new XamlParser().ParseXaml(xaml, NewResolver(), rule).ToList();
+        return Assert.Single(results).ExtractedProperties;
+    }
+
+    private static CompilationXamlTypeResolver NewResolver() =>
+        new CompilationXamlTypeResolver(CreateWpfCompilation());
+
     private static async Task<ImmutableArray<Diagnostic>> RunAnalyzerAsync(string xaml)
     {
         var compilation = CreateWpfCompilation();
-        var additionalFiles = ImmutableArray.Create<AdditionalText>(
-            new InMemoryAdditionalText("Test.xaml", xaml));
-        var options = new AnalyzerOptions(additionalFiles);
+        var files = ImmutableArray.Create<AdditionalText>(new InMemoryAdditionalText("Test.xaml", xaml));
+        var options = new AnalyzerOptions(files);
 
         var withAnalyzers = compilation.WithAnalyzers(
             ImmutableArray.Create<DiagnosticAnalyzer>(new XamlRuleAnalyzer()),
@@ -376,9 +355,11 @@ public class XamlRuleAnalyzerTests
         foreach (var name in new[] { "PresentationFramework", "PresentationCore", "WindowsBase" })
             references.Add(MetadataReference.CreateFromFile(Assembly.Load(name).Location));
 
-        // Reference this test assembly so the resolver can find StaticValues (used by the
-        // {x:Static} test) and reflection can load it at runtime.
+        // Reference this test assembly so the resolver can find StaticValues ({x:Static} test) and
+        // the analyzer can discover TestSliderRulesLoader; reference contracts so its attribute /
+        // IXamlRulesLoader symbols resolve.
         references.Add(MetadataReference.CreateFromFile(typeof(XamlRuleAnalyzerTests).Assembly.Location));
+        references.Add(MetadataReference.CreateFromFile(typeof(XamlRule).Assembly.Location));
 
         return CSharpCompilation.Create(
             "TargetAssembly",
@@ -411,4 +392,34 @@ public class XamlRuleAnalyzerTests
 public static class StaticValues
 {
     public static double SliderMinimum => 42;
+}
+
+/// <summary>
+/// Discovered by the analyzer (it's in this test assembly, which the test compilation references and
+/// which references the contracts assembly). Supplies the Slider Minimum &lt;= Maximum rule.
+/// </summary>
+[XamlRulesLoader]
+public sealed class TestSliderRulesLoader : IXamlRulesLoader
+{
+    public IReadOnlyList<XamlRule> CreateRules() => new[]
+    {
+        new XamlRule(
+            new XamlElementType("System.Windows.Controls", "Slider", "PresentationFramework"),
+            new[] { "Minimum", "Maximum" },
+            MinimumNotGreaterThanMaximum),
+    };
+
+    private static bool MinimumNotGreaterThanMaximum(Dictionary<string, string> props)
+    {
+        if (TryGetDouble(props, "Minimum", out var min) && TryGetDouble(props, "Maximum", out var max))
+            return min <= max;
+        return true; // can't determine -> don't flag
+    }
+
+    private static bool TryGetDouble(Dictionary<string, string> props, string key, out double value)
+    {
+        value = 0;
+        return props.TryGetValue(key, out var text)
+            && double.TryParse(text, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out value);
+    }
 }

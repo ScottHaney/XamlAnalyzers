@@ -2,6 +2,7 @@
 using System;
 using System.Collections.Generic;
 using Microsoft.CodeAnalysis;
+using XamlRules;
 using XamlUtils;
 
 namespace WpfCustomAnalyzer

@@ -13,4 +13,8 @@
     <PackageReference Include="Portable.Xaml" Version="0.26.0" />
   </ItemGroup>
 
+  <ItemGroup>
+    <ProjectReference Include="..\XamlRulesContracts\XamlRulesContracts.csproj" />
+  </ItemGroup>
+
 </Project>

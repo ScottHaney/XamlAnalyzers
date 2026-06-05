@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Reflection;
 using Portable.Xaml;
 using Portable.Xaml.Schema;
+using XamlRules;
 
 namespace XamlUtils
 {

@@ -5,6 +5,9 @@
     <!-- Needed by XamlRuleAnalyzer/CompilationXamlTypeResolver (C# 9 patterns); netstandard2.0
          otherwise defaults to C# 7.3. -->
     <LangVersion>latest</LangVersion>
+    <!-- Copy dependency assemblies (XamlUtils, Portable.Xaml) into the output so the whole analyzer
+         can be loaded into another project's analyzer context, not just the primary assembly. -->
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
   </PropertyGroup>
 
   <ItemGroup>
@@ -17,6 +20,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\XamlUtils\XamlUtils.csproj" />
+    <ProjectReference Include="..\XamlRulesContracts\XamlRulesContracts.csproj" />
   </ItemGroup>
 
 </Project>
